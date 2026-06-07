@@ -99,13 +99,23 @@ static constexpr unsigned long BUTTON_DEBOUNCE_MS = 250;
 #define AQUAPI_FETCH_INTERVAL_SECONDS 60
 #endif
 
-#ifndef AUTO_ROTATION_SECONDS
-#define AUTO_ROTATION_SECONDS 20
+#ifndef AUTO_CALENDAR_SECONDS
+#define AUTO_CALENDAR_SECONDS 30
+#endif
+
+#ifndef AUTO_NETWATCH_SECONDS
+#define AUTO_NETWATCH_SECONDS 15
+#endif
+
+#ifndef AUTO_AQUAPI_SECONDS
+#define AUTO_AQUAPI_SECONDS 15
 #endif
 
 static constexpr unsigned long NETWATCH_FETCH_INTERVAL_MS = NETWATCH_FETCH_INTERVAL_SECONDS * 1000UL;
 static constexpr unsigned long AQUAPI_FETCH_INTERVAL_MS = AQUAPI_FETCH_INTERVAL_SECONDS * 1000UL;
-static constexpr unsigned long AUTO_ROTATION_INTERVAL_MS = AUTO_ROTATION_SECONDS * 1000UL;
+static constexpr unsigned long AUTO_CALENDAR_INTERVAL_MS = AUTO_CALENDAR_SECONDS * 1000UL;
+static constexpr unsigned long AUTO_NETWATCH_INTERVAL_MS = AUTO_NETWATCH_SECONDS * 1000UL;
+static constexpr unsigned long AUTO_AQUAPI_INTERVAL_MS = AUTO_AQUAPI_SECONDS * 1000UL;
 
 // ------------------------------------------------------------
 // State
@@ -979,7 +989,6 @@ void drawNetwatchMode() {
   const uint16_t accent = levelColor(netwatchStatus.level);
 
   drawTextCenter(label.c_str(), SCREEN_W / 2, 38, 4, accent);
-  drawTextLeft("Status History", 18, 78, 1, COLOR_DIM);
 
   const int maxDots = 24;
   const int count = netwatchStatus.historyLevels.size() < maxDots
@@ -996,10 +1005,8 @@ void drawNetwatchMode() {
       color = levelColor(netwatchStatus.historyLevels[startIndex + i]);
     }
 
-    M5.Display.fillCircle(22 + i * 12, 105, 4, color);
+    M5.Display.fillRect(18 + i * 12, 101, 8, 8, color);
   }
-
-  drawTextCenter("Last 2h", SCREEN_W / 2, 125, 1, COLOR_DIM);
 
   String detail = netwatchStatus.primaryReasonText;
   if (detail.length() == 0) {
@@ -1192,6 +1199,15 @@ DisplayMode nextAutoContentMode(DisplayMode mode) {
   }
 }
 
+unsigned long autoDisplayIntervalMs(DisplayMode mode) {
+  switch (mode) {
+    case DisplayMode::Calendar: return AUTO_CALENDAR_INTERVAL_MS;
+    case DisplayMode::Netwatch: return AUTO_NETWATCH_INTERVAL_MS;
+    case DisplayMode::AquaPi:   return AUTO_AQUAPI_INTERVAL_MS;
+    default:                    return AUTO_CALENDAR_INTERVAL_MS;
+  }
+}
+
 void switchCalendarPage() {
   displayState.calendarPageIndex = (displayState.calendarPageIndex + 1) % static_cast<int>(CalendarPage::Count);
 
@@ -1252,7 +1268,7 @@ void updateAutoRotation() {
 
   const unsigned long now = millis();
 
-  if (now - lastAutoRotationAt < AUTO_ROTATION_INTERVAL_MS) {
+  if (now - lastAutoRotationAt < autoDisplayIntervalMs(autoContentMode)) {
     return;
   }
 
