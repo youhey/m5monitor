@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "secrets.h"
+#include "settings.h"
 
 // ============================================================
 // M5Stack Basic V2.7 - Multi Mode Monitor
