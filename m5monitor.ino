@@ -10,7 +10,7 @@
 #include "secrets.h"
 
 // ============================================================
-// M5Stack Basic V2.7 - Multi Mode Calendar
+// M5Stack Basic V2.7 - Multi Mode Monitor
 // ------------------------------------------------------------
 // Modes:
 //   1. Calendar: existing 3 calendar pages
