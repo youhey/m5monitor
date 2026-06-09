@@ -18,6 +18,7 @@
 //   2. Netwatch: compact network status
 //   3. AquaPi: compact aquarium status
 //   4. Auto: Calendar / Netwatch / AquaPi rotation
+//   5. Alert: forced aquarium alert screen
 //
 // Button:
 //   - A / left button: switch page in current mode
@@ -93,12 +94,24 @@ static constexpr unsigned long BUTTON_DEBOUNCE_MS = 250;
 #define AQUAPI_COMPACT_URL "http://aquapi:8080/api/monitoring/compact"
 #endif
 
+#ifndef AQUAPI_LEAK_LATEST_URL
+#define AQUAPI_LEAK_LATEST_URL "http://aquapi:8080/api/leak/latest"
+#endif
+
+#ifndef AQUAPI_TANKS_LATEST_URL
+#define AQUAPI_TANKS_LATEST_URL "http://aquapi:8080/api/tanks/latest"
+#endif
+
 #ifndef NETWATCH_FETCH_INTERVAL_SECONDS
 #define NETWATCH_FETCH_INTERVAL_SECONDS 30
 #endif
 
 #ifndef AQUAPI_FETCH_INTERVAL_SECONDS
 #define AQUAPI_FETCH_INTERVAL_SECONDS 60
+#endif
+
+#ifndef AQUAPI_ALERT_FETCH_INTERVAL_SECONDS
+#define AQUAPI_ALERT_FETCH_INTERVAL_SECONDS 15
 #endif
 
 #ifndef AUTO_CALENDAR_SECONDS
@@ -113,8 +126,25 @@ static constexpr unsigned long BUTTON_DEBOUNCE_MS = 250;
 #define AUTO_AQUAPI_SECONDS 15
 #endif
 
+#ifndef ALARM_BEEP_ON_MS
+#define ALARM_BEEP_ON_MS 120
+#endif
+
+#ifndef ALARM_BEEP_OFF_MS
+#define ALARM_BEEP_OFF_MS 380
+#endif
+
+#ifndef ALARM_BEEP_FREQUENCY_HZ
+#define ALARM_BEEP_FREQUENCY_HZ 2200
+#endif
+
+#ifndef ALARM_VOLUME
+#define ALARM_VOLUME 255
+#endif
+
 static constexpr unsigned long NETWATCH_FETCH_INTERVAL_MS = NETWATCH_FETCH_INTERVAL_SECONDS * 1000UL;
 static constexpr unsigned long AQUAPI_FETCH_INTERVAL_MS = AQUAPI_FETCH_INTERVAL_SECONDS * 1000UL;
+static constexpr unsigned long AQUAPI_ALERT_FETCH_INTERVAL_MS = AQUAPI_ALERT_FETCH_INTERVAL_SECONDS * 1000UL;
 static constexpr unsigned long AUTO_CALENDAR_INTERVAL_MS = AUTO_CALENDAR_SECONDS * 1000UL;
 static constexpr unsigned long AUTO_NETWATCH_INTERVAL_MS = AUTO_NETWATCH_SECONDS * 1000UL;
 static constexpr unsigned long AUTO_AQUAPI_INTERVAL_MS = AUTO_AQUAPI_SECONDS * 1000UL;
@@ -126,7 +156,8 @@ enum class DisplayMode {
   Calendar,
   Netwatch,
   AquaPi,
-  Auto
+  Auto,
+  Alert
 };
 
 enum class CalendarPage {
@@ -169,6 +200,16 @@ struct AquaPiTankStatus {
   bool alert;
 };
 
+struct AquaPiLeakStatus {
+  String status;
+  String label;
+  bool alert;
+  bool hasData;
+  bool hasError;
+  String errorMessage;
+  unsigned long lastFetchAt;
+};
+
 struct AquaPiCompactStatus {
   String level;
   String label;
@@ -177,10 +218,14 @@ struct AquaPiCompactStatus {
   String message;
   int issueCount;
   std::vector<AquaPiTankStatus> tanks;
+  AquaPiLeakStatus leak;
   bool hasData;
   bool hasError;
   String errorMessage;
   unsigned long lastFetchAt;
+  bool tanksHasError;
+  String tanksErrorMessage;
+  unsigned long tanksLastFetchAt;
 };
 
 static DisplayState displayState = {
@@ -193,7 +238,17 @@ static DisplayState displayState = {
 };
 
 static DisplayMode autoContentMode = DisplayMode::Calendar;
+static DisplayMode previousModeBeforeAlert = DisplayMode::Calendar;
 static unsigned long lastAutoRotationAt = 0;
+
+static bool alertModeActive = false;
+static bool alarmActive = false;
+static bool alarmSilenced = false;
+static bool alarmBeepOn = false;
+static int safeConfirmCount = 0;
+static uint8_t activeAlertReasons = 0;
+static uint8_t alertSafeCheckedReasons = 0;
+static unsigned long lastAlarmBeepToggleAt = 0;
 
 static NetwatchCompactStatus netwatchStatus;
 static AquaPiCompactStatus aquapiStatus;
@@ -293,6 +348,7 @@ const char* displayModeName(DisplayMode mode) {
     case DisplayMode::Netwatch: return "NETWATCH";
     case DisplayMode::AquaPi:   return "AQUAPI";
     case DisplayMode::Auto:     return "AUTO";
+    case DisplayMode::Alert:    return "ALERT";
     default:                    return "UNKNOWN";
   }
 }
@@ -385,6 +441,43 @@ uint16_t tankStatusColor(const String& status) {
   return COLOR_DIM;
 }
 
+static constexpr uint8_t ALERT_REASON_LEAK = 1 << 0;
+static constexpr uint8_t ALERT_REASON_TANK_DANGER = 1 << 1;
+
+bool hasLeakAlert() {
+  return aquapiStatus.leak.alert || aquapiStatus.leak.status == "wet";
+}
+
+int dangerTankCount() {
+  int count = 0;
+
+  for (const AquaPiTankStatus& tank : aquapiStatus.tanks) {
+    if (tank.status == "danger") {
+      ++count;
+    }
+  }
+
+  return count;
+}
+
+bool hasAquaPiAlertCondition() {
+  return hasLeakAlert() || dangerTankCount() > 0;
+}
+
+uint8_t currentAquaPiAlertReasons() {
+  uint8_t reasons = 0;
+
+  if (hasLeakAlert()) {
+    reasons |= ALERT_REASON_LEAK;
+  }
+
+  if (dangerTankCount() > 0) {
+    reasons |= ALERT_REASON_TANK_DANGER;
+  }
+
+  return reasons;
+}
+
 int firstWeekdayOfMonth(const struct tm& timeinfo) {
   // Return 0=SUN, 1=MON, ... 6=SAT
   const int day = timeinfo.tm_mday;
@@ -422,6 +515,165 @@ void applyAutoBrightness(const struct tm& timeinfo) {
 
   Serial.print("[brightness] ");
   Serial.println(brightness);
+}
+
+// ------------------------------------------------------------
+// Alert state / alarm
+// ------------------------------------------------------------
+unsigned long currentAquaPiFetchIntervalMs() {
+  return alertModeActive ? AQUAPI_ALERT_FETCH_INTERVAL_MS : AQUAPI_FETCH_INTERVAL_MS;
+}
+
+void resetDrawCache() {
+  lastDrawnYear = -1;
+  lastDrawnMonth = -1;
+  lastDrawnDay = -1;
+  lastDrawnMode = -1;
+  lastDrawnCalendarPage = -1;
+  lastDrawnAutoContentMode = -1;
+}
+
+void stopAlarmSound() {
+  M5.Speaker.stop();
+  alarmActive = false;
+  alarmBeepOn = false;
+}
+
+void silenceAlarm() {
+  if (!alertModeActive) {
+    return;
+  }
+
+  stopAlarmSound();
+  alarmSilenced = true;
+  Serial.println("[alert] alarm silenced");
+}
+
+void startAlarmForIncident() {
+  alarmActive = true;
+  alarmSilenced = false;
+  alarmBeepOn = false;
+  lastAlarmBeepToggleAt = millis() - ALARM_BEEP_OFF_MS;
+}
+
+void enterAlertMode(uint8_t reasons) {
+  if (alertModeActive) {
+    activeAlertReasons |= reasons;
+    alertSafeCheckedReasons = 0;
+    safeConfirmCount = 0;
+    return;
+  }
+
+  previousModeBeforeAlert = displayState.mode;
+  displayState.mode = DisplayMode::Alert;
+  alertModeActive = true;
+  activeAlertReasons = reasons;
+  alertSafeCheckedReasons = 0;
+  safeConfirmCount = 0;
+  startAlarmForIncident();
+  resetDrawCache();
+
+  Serial.println("[alert] enter");
+}
+
+void exitAlertMode() {
+  if (!alertModeActive) {
+    return;
+  }
+
+  stopAlarmSound();
+  alarmSilenced = false;
+  safeConfirmCount = 0;
+  activeAlertReasons = 0;
+  alertSafeCheckedReasons = 0;
+  alertModeActive = false;
+  displayState.mode = previousModeBeforeAlert;
+  resetDrawCache();
+
+  Serial.print("[alert] exit -> ");
+  Serial.println(displayModeName(displayState.mode));
+}
+
+void recordAlertCheck(uint8_t reason, bool active) {
+  if (active) {
+    enterAlertMode(reason);
+    return;
+  }
+
+  if (!alertModeActive) {
+    return;
+  }
+
+  const uint8_t relevantReason = reason & activeAlertReasons;
+  if (relevantReason == 0) {
+    return;
+  }
+
+  alertSafeCheckedReasons |= relevantReason;
+
+  if ((alertSafeCheckedReasons & activeAlertReasons) == activeAlertReasons) {
+    ++safeConfirmCount;
+    alertSafeCheckedReasons = 0;
+
+    Serial.print("[alert] safe confirm ");
+    Serial.println(safeConfirmCount);
+
+    if (safeConfirmCount >= 3) {
+      exitAlertMode();
+    }
+  }
+}
+
+void recordAlertCheckError(uint8_t reason) {
+  if (!alertModeActive) {
+    return;
+  }
+
+  if ((reason & activeAlertReasons) != 0) {
+    alertSafeCheckedReasons = 0;
+  }
+}
+
+void updateAlertStateFromAquaPiData() {
+  const uint8_t reasons = currentAquaPiAlertReasons();
+
+  if (reasons != 0) {
+    enterAlertMode(reasons);
+    return;
+  }
+
+  if (!alertModeActive || !aquapiStatus.hasData || aquapiStatus.hasError) {
+    return;
+  }
+
+  recordAlertCheck(activeAlertReasons, false);
+}
+
+void updateAlarmSound() {
+  if (!alertModeActive || !alarmActive || alarmSilenced) {
+    if (alarmBeepOn) {
+      M5.Speaker.stop();
+      alarmBeepOn = false;
+    }
+    return;
+  }
+
+  const unsigned long now = millis();
+
+  if (alarmBeepOn) {
+    if (now - lastAlarmBeepToggleAt >= ALARM_BEEP_ON_MS) {
+      M5.Speaker.stop();
+      alarmBeepOn = false;
+      lastAlarmBeepToggleAt = now;
+    }
+    return;
+  }
+
+  if (now - lastAlarmBeepToggleAt >= ALARM_BEEP_OFF_MS) {
+    M5.Speaker.tone(ALARM_BEEP_FREQUENCY_HZ, ALARM_BEEP_ON_MS);
+    alarmBeepOn = true;
+    lastAlarmBeepToggleAt = now;
+  }
 }
 
 // ------------------------------------------------------------
@@ -500,7 +752,11 @@ bool httpGetText(const char* url, String& payload, String& errorMessage) {
   const int statusCode = http.GET();
 
   if (statusCode != HTTP_CODE_OK) {
-    errorMessage = "HTTP " + String(statusCode);
+    if (statusCode < 0) {
+      errorMessage = "HTTP Error";
+    } else {
+      errorMessage = "HTTP " + String(statusCode);
+    }
     http.end();
     return false;
   }
@@ -595,10 +851,51 @@ bool fetchNetwatchCompact(bool force = false) {
   return true;
 }
 
+void applyLeakStatus(JsonVariant leak) {
+  aquapiStatus.leak.status = leak["status"] | "unknown";
+  aquapiStatus.leak.label = leak["label"] | "";
+  aquapiStatus.leak.alert = leak["alert"] | false;
+  aquapiStatus.leak.hasData = !leak.isNull();
+  aquapiStatus.leak.hasError = false;
+  aquapiStatus.leak.errorMessage = "";
+}
+
+void applyTankStatuses(JsonArray tanks) {
+  aquapiStatus.tanks.clear();
+
+  for (JsonVariant tankValue : tanks) {
+    JsonObject tank = tankValue.as<JsonObject>();
+    AquaPiTankStatus tankStatus;
+
+    const char* shortName = tank["short_name_ascii"] | "";
+    const char* name = tank["name"] | "";
+    const char* sensorId = tank["sensor_id"] | "";
+
+    if (strlen(shortName) > 0) {
+      tankStatus.shortName = shortName;
+    } else if (strlen(name) > 0) {
+      tankStatus.shortName = name;
+    } else if (strlen(sensorId) > 0) {
+      tankStatus.shortName = sensorId;
+    } else {
+      tankStatus.shortName = "tank";
+    }
+
+    tankStatus.temperatureC = tank["temperature_c"] | NAN;
+    tankStatus.status = tank["status"] | "unknown";
+    tankStatus.alert = tank["alert"] | false;
+    aquapiStatus.tanks.push_back(tankStatus);
+  }
+
+  aquapiStatus.tanksHasError = false;
+  aquapiStatus.tanksErrorMessage = "";
+}
+
 bool fetchAquaPiCompact(bool force = false) {
   const unsigned long now = millis();
+  const unsigned long fetchIntervalMs = currentAquaPiFetchIntervalMs();
 
-  if (!force && aquapiStatus.lastFetchAt > 0 && now - aquapiStatus.lastFetchAt < AQUAPI_FETCH_INTERVAL_MS) {
+  if (!force && aquapiStatus.lastFetchAt > 0 && now - aquapiStatus.lastFetchAt < fetchIntervalMs) {
     return false;
   }
 
@@ -632,44 +929,138 @@ bool fetchAquaPiCompact(bool force = false) {
   aquapiStatus.title = doc["title"] | "";
   aquapiStatus.message = doc["message"] | "";
   aquapiStatus.issueCount = doc["issue_count"] | 0;
-  aquapiStatus.tanks.clear();
 
-  JsonArray tanks = doc["tanks"].as<JsonArray>();
-  for (JsonVariant tankValue : tanks) {
-    JsonObject tank = tankValue.as<JsonObject>();
-    AquaPiTankStatus tankStatus;
-
-    const char* shortName = tank["short_name_ascii"] | "";
-    const char* name = tank["name"] | "";
-    const char* sensorId = tank["sensor_id"] | "";
-
-    if (strlen(shortName) > 0) {
-      tankStatus.shortName = shortName;
-    } else if (strlen(name) > 0) {
-      tankStatus.shortName = name;
-    } else if (strlen(sensorId) > 0) {
-      tankStatus.shortName = sensorId;
-    } else {
-      tankStatus.shortName = "tank";
-    }
-
-    tankStatus.temperatureC = tank["temperature_c"] | NAN;
-    tankStatus.status = tank["status"] | "unknown";
-    tankStatus.alert = tank["alert"] | false;
-    aquapiStatus.tanks.push_back(tankStatus);
-  }
+  applyLeakStatus(doc["leak"]);
+  applyTankStatuses(doc["tanks"].as<JsonArray>());
 
   aquapiStatus.hasData = true;
   aquapiStatus.hasError = false;
   aquapiStatus.errorMessage = "";
   aquapiStatus.lastFetchAt = now;
 
+  updateAlertStateFromAquaPiData();
+
   Serial.println("[aquapi] fetch ok");
+  return true;
+}
+
+bool fetchAquaPiLeakLatest(bool force = false) {
+  const unsigned long now = millis();
+
+  if (!force && aquapiStatus.leak.lastFetchAt > 0 && now - aquapiStatus.leak.lastFetchAt < AQUAPI_ALERT_FETCH_INTERVAL_MS) {
+    return false;
+  }
+
+  String payload;
+  String errorMessage;
+
+  if (!httpGetText(AQUAPI_LEAK_LATEST_URL, payload, errorMessage)) {
+    aquapiStatus.leak.hasError = true;
+    aquapiStatus.leak.errorMessage = errorMessage;
+    aquapiStatus.leak.lastFetchAt = now;
+    recordAlertCheckError(ALERT_REASON_LEAK);
+    Serial.print("[aquapi leak] fetch failed: ");
+    Serial.println(errorMessage);
+    return true;
+  }
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    aquapiStatus.leak.hasError = true;
+    aquapiStatus.leak.errorMessage = "JSON error";
+    aquapiStatus.leak.lastFetchAt = now;
+    recordAlertCheckError(ALERT_REASON_LEAK);
+    Serial.print("[aquapi leak] json failed: ");
+    Serial.println(error.c_str());
+    return true;
+  }
+
+  JsonVariant leak = doc["leak"];
+  if (leak.isNull()) {
+    leak = doc.as<JsonVariant>();
+  }
+
+  applyLeakStatus(leak);
+  aquapiStatus.leak.lastFetchAt = now;
+  recordAlertCheck(ALERT_REASON_LEAK, hasLeakAlert());
+
+  Serial.println("[aquapi leak] fetch ok");
+  return true;
+}
+
+bool fetchAquaPiTanksLatest(bool force = false) {
+  const unsigned long now = millis();
+
+  if (!force && aquapiStatus.tanksLastFetchAt > 0 && now - aquapiStatus.tanksLastFetchAt < AQUAPI_ALERT_FETCH_INTERVAL_MS) {
+    return false;
+  }
+
+  String payload;
+  String errorMessage;
+
+  if (!httpGetText(AQUAPI_TANKS_LATEST_URL, payload, errorMessage)) {
+    aquapiStatus.tanksHasError = true;
+    aquapiStatus.tanksErrorMessage = errorMessage;
+    aquapiStatus.tanksLastFetchAt = now;
+    recordAlertCheckError(ALERT_REASON_TANK_DANGER);
+    Serial.print("[aquapi tanks] fetch failed: ");
+    Serial.println(errorMessage);
+    return true;
+  }
+
+  DynamicJsonDocument doc(12288);
+  DeserializationError error = deserializeJson(doc, payload);
+
+  if (error) {
+    aquapiStatus.tanksHasError = true;
+    aquapiStatus.tanksErrorMessage = "JSON error";
+    aquapiStatus.tanksLastFetchAt = now;
+    recordAlertCheckError(ALERT_REASON_TANK_DANGER);
+    Serial.print("[aquapi tanks] json failed: ");
+    Serial.println(error.c_str());
+    return true;
+  }
+
+  JsonArray tanks;
+  JsonVariant tanksValue = doc["tanks"];
+
+  if (!tanksValue.isNull()) {
+    tanks = tanksValue.as<JsonArray>();
+  } else if (doc.is<JsonArray>()) {
+    tanks = doc.as<JsonArray>();
+  }
+
+  if (tanks.isNull()) {
+    aquapiStatus.tanksHasError = true;
+    aquapiStatus.tanksErrorMessage = "JSON shape error";
+    aquapiStatus.tanksLastFetchAt = now;
+    recordAlertCheckError(ALERT_REASON_TANK_DANGER);
+    Serial.println("[aquapi tanks] json shape failed");
+    return true;
+  }
+
+  applyTankStatuses(tanks);
+  aquapiStatus.tanksLastFetchAt = now;
+  recordAlertCheck(ALERT_REASON_TANK_DANGER, dangerTankCount() > 0);
+
+  Serial.println("[aquapi tanks] fetch ok");
   return true;
 }
 
 void fetchForVisibleMode(bool force = false) {
   DisplayMode contentMode = displayState.mode;
+
+  if (displayState.mode == DisplayMode::Alert) {
+    if ((activeAlertReasons & ALERT_REASON_LEAK) != 0) {
+      fetchAquaPiLeakLatest(force);
+    }
+    if ((activeAlertReasons & ALERT_REASON_TANK_DANGER) != 0) {
+      fetchAquaPiTanksLatest(force);
+    }
+    return;
+  }
 
   if (displayState.mode == DisplayMode::Auto) {
     contentMode = autoContentMode;
@@ -1022,19 +1413,28 @@ void drawNetwatchMode() {
   drawTextCenter(detail.c_str(), SCREEN_W / 2, 168, 2, COLOR_MAIN);
 
   if (netwatchStatus.hasError) {
-    drawTextCenter(compactText(netwatchStatus.errorMessage, 32).c_str(), SCREEN_W / 2, 218, 1, TFT_YELLOW);
+    drawTextCenter(compactText(netwatchStatus.errorMessage, 32).c_str(), SCREEN_W / 2, 218, 2, TFT_YELLOW);
   }
 }
 
 // ------------------------------------------------------------
 // Mode: AquaPi
 // ------------------------------------------------------------
+void drawLeakStatusLine(int y) {
+  const bool leakAlert = hasLeakAlert();
+  const char* text = leakAlert ? "LEAK ALERT!" : "LEAK SAFE";
+  const uint16_t color = leakAlert ? TFT_RED : COLOR_WEEKDAY;
+
+  drawTextCenter(text, SCREEN_W / 2, y, 2, color);
+}
+
 void drawAquaPiMode() {
   M5.Display.fillScreen(COLOR_BG);
 
   if (!aquapiStatus.hasData) {
     drawTextCenter("AQUA UNK", SCREEN_W / 2, 52, 4, COLOR_DIM);
     drawTextCenter(aquapiStatus.hasError ? aquapiStatus.errorMessage.c_str() : "NO DATA", SCREEN_W / 2, 124, 2, COLOR_SUB);
+    drawLeakStatusLine(224);
     return;
   }
 
@@ -1074,11 +1474,81 @@ void drawAquaPiMode() {
   }
 
   if (aquapiStatus.hasError) {
-    drawTextCenter(compactText(aquapiStatus.errorMessage, 32).c_str(), SCREEN_W / 2, 218, 1, TFT_YELLOW);
+    drawTextCenter(compactText(aquapiStatus.errorMessage, 32).c_str(), SCREEN_W / 2, 204, 2, TFT_YELLOW);
   } else if (aquapiStatus.issueCount > 0) {
     String issueText = "issues: " + String(aquapiStatus.issueCount);
-    drawTextCenter(issueText.c_str(), SCREEN_W / 2, 218, 1, TFT_YELLOW);
+    drawTextCenter(issueText.c_str(), SCREEN_W / 2, 204, 2, TFT_YELLOW);
   }
+
+  drawLeakStatusLine(224);
+}
+
+// ------------------------------------------------------------
+// Mode: Alert
+// ------------------------------------------------------------
+void drawAlertMode() {
+  M5.Display.fillScreen(COLOR_BG);
+
+  const bool leakAlert = hasLeakAlert();
+  const int dangerCount = dangerTankCount();
+
+  drawTextCenter("!!! AQUA ALERT !!!", SCREEN_W / 2, 28, 2, TFT_RED);
+
+  if (leakAlert) {
+    drawTextCenter("LEAK DETECTED", SCREEN_W / 2, 78, 3, TFT_RED);
+
+    if (dangerCount > 0) {
+      String dangerText = "TEMP DANGER: " + String(dangerCount) + " tanks";
+      drawTextCenter(dangerText.c_str(), SCREEN_W / 2, 126, 2, TFT_YELLOW);
+    } else {
+      drawTextCenter("Check aquarium area", SCREEN_W / 2, 122, 2, COLOR_MAIN);
+      drawTextCenter("and floor immediately", SCREEN_W / 2, 148, 2, COLOR_MAIN);
+    }
+  } else if (dangerCount > 0) {
+    drawTextCenter("TEMP DANGER", SCREEN_W / 2, 72, 3, TFT_RED);
+
+    int drawn = 0;
+    for (const AquaPiTankStatus& tank : aquapiStatus.tanks) {
+      if (tank.status != "danger") {
+        continue;
+      }
+
+      String name = compactText(tank.shortName, 8);
+      char line[28];
+
+      if (isnan(tank.temperatureC)) {
+        snprintf(line, sizeof(line), "%-8s --.-C", name.c_str());
+      } else {
+        snprintf(line, sizeof(line), "%-8s %4.1fC", name.c_str(), tank.temperatureC);
+      }
+
+      drawTextCenter(line, SCREEN_W / 2, 120 + drawn * 24, 2, COLOR_MAIN);
+      ++drawn;
+
+      if (drawn >= 3) {
+        break;
+      }
+    }
+
+    if (dangerCount > 3) {
+      String moreText = "+" + String(dangerCount - 3) + " more";
+      drawTextCenter(moreText.c_str(), SCREEN_W / 2, 196, 1, COLOR_SUB);
+    }
+  } else {
+    drawTextCenter("RECOVERY CHECK", SCREEN_W / 2, 88, 2, TFT_YELLOW);
+    String safeText = "safe " + String(safeConfirmCount) + "/3";
+    drawTextCenter(safeText.c_str(), SCREEN_W / 2, 126, 2, COLOR_MAIN);
+  }
+
+  if (aquapiStatus.hasError) {
+    drawTextCenter(compactText(aquapiStatus.errorMessage, 32).c_str(), SCREEN_W / 2, 204, 2, TFT_YELLOW);
+  } else if (aquapiStatus.leak.hasError) {
+    drawTextCenter(compactText(aquapiStatus.leak.errorMessage, 32).c_str(), SCREEN_W / 2, 204, 2, TFT_YELLOW);
+  } else if (aquapiStatus.tanksHasError) {
+    drawTextCenter(compactText(aquapiStatus.tanksErrorMessage, 32).c_str(), SCREEN_W / 2, 204, 2, TFT_YELLOW);
+  }
+
+  drawTextCenter("[ANY BUTTON] SILENCE", SCREEN_W / 2, 224, 2, COLOR_SUB);
 }
 
 void drawAutoBadge() {
@@ -1096,6 +1566,19 @@ void drawAutoBadge() {
 // ------------------------------------------------------------
 void drawCurrentMode(const struct tm& timeinfo) {
   applyAutoBrightness(timeinfo);
+
+  if (displayState.mode == DisplayMode::Alert) {
+    Serial.println("[draw] mode=ALERT");
+    drawAlertMode();
+    lastDrawnYear = timeinfo.tm_year + 1900;
+    lastDrawnMonth = timeinfo.tm_mon + 1;
+    lastDrawnDay = timeinfo.tm_mday;
+    lastDrawnMode = static_cast<int>(displayState.mode);
+    lastDrawnCalendarPage = displayState.calendarPageIndex;
+    lastDrawnAutoContentMode = static_cast<int>(autoContentMode);
+    displayState.lastDrawAt = millis();
+    return;
+  }
 
   DisplayMode contentMode = displayState.mode;
 
@@ -1154,6 +1637,11 @@ void redrawIfNeeded() {
   struct tm timeinfo;
 
   if (!getLocalTime(&timeinfo, 100)) {
+    if (displayState.mode == DisplayMode::Alert && lastDrawnMode != static_cast<int>(DisplayMode::Alert)) {
+      drawAlertMode();
+      lastDrawnMode = static_cast<int>(DisplayMode::Alert);
+      displayState.lastDrawAt = millis();
+    }
     return;
   }
 
@@ -1176,6 +1664,13 @@ void redrawIfNeeded() {
 }
 
 void forceRedraw() {
+  if (displayState.mode == DisplayMode::Alert) {
+    drawAlertMode();
+    lastDrawnMode = static_cast<int>(DisplayMode::Alert);
+    displayState.lastDrawAt = millis();
+    return;
+  }
+
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 1000)) {
     drawCurrentMode(timeinfo);
@@ -1202,6 +1697,7 @@ DisplayMode nextManualMode(DisplayMode mode) {
     case DisplayMode::Netwatch: return DisplayMode::AquaPi;
     case DisplayMode::AquaPi:   return DisplayMode::Auto;
     case DisplayMode::Auto:     return DisplayMode::Calendar;
+    case DisplayMode::Alert:    return DisplayMode::Alert;
     default:                    return DisplayMode::Calendar;
   }
 }
@@ -1256,6 +1752,14 @@ void forceFetchAndRedraw() {
 
 void handleButtons() {
   // wasClicked() becomes reliable only when M5.update() is called frequently.
+  if (displayState.mode == DisplayMode::Alert) {
+    if ((M5.BtnA.wasClicked() || M5.BtnB.wasClicked() || M5.BtnC.wasClicked()) && acceptButtonEvent()) {
+      silenceAlarm();
+      forceRedraw();
+    }
+    return;
+  }
+
   if (M5.BtnA.wasClicked() && acceptButtonEvent()) {
     DisplayMode contentMode = displayState.mode == DisplayMode::Auto
       ? autoContentMode
@@ -1278,7 +1782,7 @@ void handleButtons() {
 }
 
 void updateAutoRotation() {
-  if (displayState.mode != DisplayMode::Auto) {
+  if (displayState.mode != DisplayMode::Auto || alertModeActive) {
     return;
   }
 
@@ -1306,11 +1810,31 @@ void updateVisibleDataFetch() {
   }
 
   bool changed = false;
+  const bool aquapiVisible = contentMode == DisplayMode::AquaPi || contentMode == DisplayMode::Alert;
+
+  if (alertModeActive) {
+    if ((activeAlertReasons & ALERT_REASON_LEAK) != 0) {
+      changed = fetchAquaPiLeakLatest(false) || changed;
+    }
+
+    if ((activeAlertReasons & ALERT_REASON_TANK_DANGER) != 0) {
+      changed = fetchAquaPiTanksLatest(false) || changed;
+    }
+
+    if (changed) {
+      forceRedraw();
+    }
+    return;
+  }
+
+  const bool aquapiChanged = fetchAquaPiCompact(false);
 
   if (contentMode == DisplayMode::Netwatch) {
     changed = fetchNetwatchCompact(false);
-  } else if (contentMode == DisplayMode::AquaPi) {
-    changed = fetchAquaPiCompact(false);
+  }
+
+  if (aquapiChanged && (aquapiVisible || alertModeActive)) {
+    changed = true;
   }
 
   if (changed) {
@@ -1331,6 +1855,7 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(60);
   M5.Display.fillScreen(COLOR_BG);
+  M5.Speaker.setVolume(ALARM_VOLUME);
 
   Serial.println("[boot] M5 Multi Mode Calendar");
 
@@ -1345,6 +1870,7 @@ void loop() {
   M5.update();
 
   handleButtons();
+  updateAlarmSound();
 
   const unsigned long now = millis();
 
